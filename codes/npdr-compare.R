@@ -1,0 +1,228 @@
+### Load packages
+
+library(privateEC)
+library(broom)
+library(tidyverse)
+library(uniReg)
+# library(devtools)
+# install_github('insilico/npdr') # npdr install
+
+rm(list = ls())
+set.seed(1618)
+
+cbbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", 
+                "#0072B2", "#D55E00", "#CC79A7", "#c5679b", "#be548f")
+
+source("npdr.R")
+source("nearestNeighbors.R")
+source("utils.R")
+source("npdrLearner.R")
+source("adaptive.R")
+source("data.R")
+source("inbixGAIN.R")
+source("simulation2.R")
+
+### Util functions
+geneLowVarianceFilter <- function(dataMatrix, percentile=0.5) {
+  variances <- apply(as.matrix(dataMatrix), 2, var)
+  threshold <- quantile(variances, c(percentile))
+  # remove variable columns with lowest percentile variance:
+  mask <- apply(dataMatrix, 2, function(x) var(x) > threshold)
+  fdata <- dataMatrix[, mask]
+  # return the row mask and filtered data:
+  list(mask=mask, fdata=fdata)
+}
+
+clean_df_results <- function(input_df, ana_name){
+  input_df %>%
+    data.frame() %>%
+    rownames_to_column('att') %>%
+    rename(!!sym(paste0('beta.', ana_name)) := beta,
+           !!sym(paste0('pval.', ana_name)) := pval,
+           !!sym(paste0('p.adj.', ana_name)) := p.adj)
+}
+
+### Load Data
+
+load('data/unfilteredMostafavi.Rdata') ### RNA-Seq data
+dim(unfiltered.mostafavi)  # 915 subjects x (15230 genes + 1 class)
+mdd.pheno <- unfiltered.mostafavi %>% 
+  dplyr::select(class) %>% rownames_to_column('ids') 
+# 463 MDD, 452 HC
+
+# Read in sex data.frame:
+fam.data <- read_table('data/MDD_LD.fam', col_names = 
+                         c('pedigree', 'member', 'father', 'mother', 'sex', 'affected')) %>% 
+  rowwise() %>% mutate(ids = unlist(strsplit(pedigree, "[_ ]+"))[3])
+
+
+### Assocation between MDD and sex:
+
+pheno.sex <- merge(mdd.pheno, fam.data, by = 'ids')
+chisq.test(fam.data$affected, fam.data$sex)
+# table(fam.data$affected, fam.data$sex)
+table(pheno.sex$class, pheno.sex$sex)
+# 1: HC; 2: MDD
+# table(fam.data$affected, pheno.sex$class)
+
+# table(pheno.sex$class, pheno.sex$affected)
+# pheno.sex$class== pheno.sex$affected
+
+
+### Filter RNA-Seq:
+
+unfiltered.predictors.mat <- unfiltered.mostafavi %>% dplyr::select(-class)
+# strict filter so it finishes in a couple minutes
+# use .5 in real analysis, but it will take a while (a day?)
+pct <- 0 # .9, 1,524 genes, .75 3,809 vars, .98 306vars 4.7mins, .7 4570vars
+filter <- geneLowVarianceFilter(unfiltered.predictors.mat, pct)
+filtered.mostafavi.df <- data.frame(filter$fdata, class = mdd.pheno$class)
+filtered.pred <- filtered.mostafavi.df %>% dplyr::select(-class)
+dim(filtered.mostafavi.df)
+
+
+### Univariate analysis:
+
+# Simple analysis with no sex adjustment:
+class.idx <- length(colnames(filtered.mostafavi.df))
+colnames(filtered.mostafavi.df)[class.idx]
+
+gene_mdd <- uniReg(
+  outcome = 'class', 
+  dataset = filtered.mostafavi.df, 
+  regression.type = 'glm',
+  padj.method = 'bonferroni') %>%
+  clean_df_results('gene.mdd')
+
+
+# After adjusting for sex:
+
+gene_sex_mdd <- uniReg(
+  outcome = 'class', dataset = filtered.mostafavi.df, 
+  regression.type = 'glm', covars = pheno.sex$sex,
+  padj.method = 'bonferroni') %>%
+  clean_df_results('gene.sex.mdd')
+
+
+# Univariate with sex as outcome:
+
+# check if the rows are the same order: 0 = good
+sum(pheno.sex$ids != rownames(filtered.mostafavi.df))
+
+gene_sex <- uniReg(
+  outcome = pheno.sex$sex-1,
+  dataset = filtered.pred,
+  regression.type='glm',
+  padj.method = 'bonferroni') %>%
+  clean_df_results('gene.sex')
+
+# Summarize all univariate analyses:
+uni_w_wo_sex <- data.frame(gene_mdd) %>%
+  merge(gene_sex_mdd, by = 'att') %>%
+  merge(gene_sex, by = 'att')
+
+best_genes_uni <- uni_w_wo_sex %>%
+  filter(p.adj.gene.mdd < 0.05) %>%
+  arrange(p.adj.gene.mdd) 
+
+#write_csv(best_genes_uni, 'results/mostafavi_best_0.05_uni_nosex_genes.csv')
+
+source("npdr.R")
+source("nearestNeighbors.R")
+source("utils.R")
+source("npdrLearner.R")
+source("adaptive.R")
+source("data.R")
+source("inbixGAIN.R")
+source("simulation2.R")
+
+### Run NPDR, no covariate adjustment:
+
+################################### 
+start_time <- Sys.time()
+npdr.mdd.rnaseq.results <- npdr('class', filtered.mostafavi.df, regression.type='glm', attr.diff.type='numeric-abs',
+                                nbd.method='multisurf', nbd.metric = 'manhattan', msurf.sd.frac=0.5,
+                                padj.method='bonferroni')
+end_time <- Sys.time()
+end_time - start_time  # about 5 min for pct=.98, 306vars, 18min for pct=.9 and 1524 vars
+
+npdr_mdd_nosex <- npdr.mdd.rnaseq.results %>%
+  rename(beta.npdr.nosex = beta.Z.att,
+         pval.npdr.nosex  = pval.att,
+         p.adj.npdr.nosex = pval.adj)
+
+
+### Run NPDR, adjusting for sex:
+
+# sex-associated by npdr
+start_time <- Sys.time()
+npdr.mdd.sexassoc.results <- npdr('class', filtered.mostafavi.df, 
+                                  regression.type='glm', attr.diff.type='numeric-abs',
+                                  nbd.method='multisurf', nbd.metric = 'manhattan',
+                                  covars=pheno.sex$sex,  # works with sex.covar.mat as well
+                                  covar.diff.type='match-mismatch', # for categorical covar like sex
+                                  msurf.sd.frac=0.5, padj.method='bonferroni')
+end_time <- Sys.time()
+end_time - start_time  # about 5 min for pct=.98, 306vars
+
+npdr_mdd_sex <- npdr.mdd.sexassoc.results %>%
+  rename(beta.npdr.sex = beta.Z.att,
+         pval.npdr.sex  = pval.att,
+         p.adj.npdr.sex = pval.adj)
+
+
+npdr_w_wo_sex <- data.frame(gene_sex) %>%
+  merge(npdr_mdd_nosex, by = 'att') %>%
+  merge(npdr_mdd_sex, by = 'att') %>%
+  mutate(nlog10.nosex = -log10(p.adj.npdr.nosex)) %>%
+  mutate(nlog10.sex = -log10(p.adj.npdr.sex)) %>%
+  mutate(significant = as.factor((p.adj.npdr.nosex < 0.01) + (p.adj.npdr.sex < 0.01))) %>%
+  mutate(sig.genes = ifelse((p.adj.npdr.nosex < 0.01) | p.adj.npdr.sex < 0.01, att, NA)) %>%
+  mutate(nlog10.sex.genes = -log10(p.adj.gene.sex))
+
+#save(gene_sex, gene_mdd, gene_sex_mdd, npdr_mdd_nosex, npdr_mdd_sex,
+     #npdr_w_wo_sex, uni_w_wo_sex, file = paste0('results/', pct, '_mostafavi_mdd_results.Rdata'))
+
+
+
+set.seed(1618)
+rnaseq_sex <- filtered.mostafavi.df %>%
+  rownames_to_column('ids') %>%
+  merge(dplyr::select(pheno.sex, ids, sex), by = 'ids') %>%
+  column_to_rownames('ids')
+
+# mostafavi_forest <- ranger::ranger(formula = class ~ ., data = rnaseq_sex,
+#                                    always.split.variables = 'sex', importance = 'permutation')
+# mostafavi_forest
+# rf.importance <- ranger::importance(mostafavi_forest)  # variable 3 best
+# rf_imp_sorted <- data.frame(importance = rf.importance) %>%
+#   rownames_to_column('att') %>%
+#   arrange(desc(importance))
+
+mostafavi_forest <- randomForest::randomForest(as.factor(class) ~ ., data = filtered.mostafavi.df, importance = T)
+rf.importance <- randomForest::importance(mostafavi_forest)  # variable 3 best
+rf_imp_sorted <- data.frame(rf.importance) %>%
+  rownames_to_column('att')
+
+#save(rf_imp_sorted, mostafavi_forest, file = paste0('results/rf_', pct, '_mostafavi_mdd_results.Rdata'))
+
+
+
+# load(paste0('results/rf_', 0, '_mostafavi_mdd_results.Rdata'))
+split_vars <- vector(mode = 'character')
+split_roots <- vector(mode = 'character')
+# all_trees <- data.frame()
+for (i in 1:500){
+  mostafavi_tree_info <- ranger::treeInfo(mostafavi_forest, tree = i)
+  split_vars <- c(split_vars, mostafavi_tree_info$splitvarName)
+  split_roots <- c(split_roots, mostafavi_tree_info$splitvarName[1])
+}
+sum(split_roots=='sex')
+sum(split_vars=='sex', na.rm = T)
+sum(!is.na(split_vars))
+tab_vars <- table(split_vars)
+tail(tab_vars)
+head(tab_vars)
+tab_vars['sex']
+head(sort(tab_vars, decreasing = T))
+sum(is.na(split_vars))
